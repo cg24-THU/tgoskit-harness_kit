@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -8,6 +9,11 @@ from typing import Any
 
 
 PROTOCOL_VERSION = "2024-11-05"
+LOCAL_QEMU_BIN = (
+    os.environ.get("TGOSKIT_HARNESS_QEMU_BIN")
+    or os.environ.get("TGOSKITS_QEMU_BIN")
+    or str(Path(__file__).resolve().parents[3] / ".local/qemu-10.2.1/bin")
+)
 
 
 def repo_root_from(start: Path) -> Path:
@@ -49,12 +55,12 @@ def tool_schema() -> list[dict[str, Any]]:
     return [
         {
             "name": "starry_syscall_doctor",
-            "description": "Check Docker image and toolchain availability for the StarryOS syscall harness.",
+            "description": "Check local toolchain availability for the StarryOS syscall harness.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
             "name": "starry_syscall_discover",
-            "description": "Run Linux-vs-StarryOS syscall probes in Docker and return the differential report.",
+            "description": "Run Linux-vs-StarryOS syscall probes locally and return the differential report.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -71,7 +77,7 @@ def tool_schema() -> list[dict[str, Any]]:
         },
         {
             "name": "starry_perf_profile",
-            "description": "Run StarryOS qperf profiling in Docker and return hotspot/fix-candidate report paths.",
+            "description": "Run StarryOS qperf profiling locally and return hotspot/fix-candidate report paths.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -93,6 +99,12 @@ def tool_schema() -> list[dict[str, Any]]:
                     "min_percent": {"type": "number", "default": 5.0, "minimum": 0.0},
                     "debug": {"type": "boolean", "default": False},
                     "kernel_filter": {"type": "boolean", "default": False},
+                    "host_time": {"type": "boolean", "default": False},
+                    "host_perf": {"type": "boolean", "default": False},
+                    "host_perf_events": {
+                        "type": "string",
+                        "default": "task-clock,cycles,instructions,cache-references,cache-misses,context-switches,cpu-migrations,page-faults",
+                    },
                     "shell_init_cmd": {"type": "string"},
                     "shell_prefix": {"type": "string", "default": "root@starry:"},
                     "qemu_args": {
@@ -135,8 +147,19 @@ def tool_schema() -> list[dict[str, Any]]:
 
 
 def run_harness(repo: Path, args: list[str]) -> tuple[int, str]:
-    cmd = ["python3", str(repo / "tools/starry-syscall-harness/harness.py"), *args]
-    result = subprocess.run(cmd, cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    cmd = [sys.executable, str(repo / "tools/starry-syscall-harness/harness.py"), *args]
+    env = os.environ.copy()
+    env["STARRY_SYSCALL_HARNESS_NO_DOCKER"] = "1"
+    path_prefix = [
+        LOCAL_QEMU_BIN,
+        "/opt/homebrew/opt/coreutils/libexec/gnubin",
+        "/opt/homebrew/bin",
+        "/opt/homebrew/opt/e2fsprogs/bin",
+        "/opt/homebrew/opt/e2fsprogs/sbin",
+    ]
+    existing_path = env.get("PATH", "")
+    env["PATH"] = ":".join([*path_prefix, existing_path]) if existing_path else ":".join(path_prefix)
+    result = subprocess.run(cmd, cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     output = result.stdout
     if result.stderr:
         output += "\n[stderr]\n" + result.stderr
@@ -147,7 +170,7 @@ def handle_tool_call(repo: Path, params: dict[str, Any]) -> dict[str, Any]:
     name = params.get("name")
     arguments = params.get("arguments") or {}
     if name == "starry_syscall_doctor":
-        code, output = run_harness(repo, ["doctor", "--repo-root", str(repo)])
+        code, output = run_harness(repo, ["doctor", "--repo-root", str(repo), "--no-docker"])
     elif name == "starry_syscall_discover":
         command = [
             "discover",
@@ -157,6 +180,7 @@ def handle_tool_call(repo: Path, params: dict[str, Any]) -> dict[str, Any]:
             arguments.get("arch", "riscv64"),
             "--timeout",
             str(arguments.get("timeout", 120)),
+            "--no-docker",
         ]
         if arguments.get("fail_on_diff", False):
             command.append("--fail-on-diff")
@@ -182,17 +206,31 @@ def handle_tool_call(repo: Path, params: dict[str, Any]) -> dict[str, Any]:
             str(arguments.get("top", 20)),
             "--min-percent",
             str(arguments.get("min_percent", 5.0)),
+            "--no-docker",
         ]
         if arguments.get("debug", False):
             command.append("--debug")
         if arguments.get("kernel_filter", False):
             command.append("--kernel-filter")
+        if arguments.get("host_time", False):
+            command.append("--host-time")
+        if arguments.get("host_perf", False):
+            command.append("--host-perf")
+            command.extend(
+                [
+                    "--host-perf-events",
+                    arguments.get(
+                        "host_perf_events",
+                        "task-clock,cycles,instructions,cache-references,cache-misses,context-switches,cpu-migrations,page-faults",
+                    ),
+                ]
+            )
         if arguments.get("shell_init_cmd"):
             command.extend(["--shell-init-cmd", arguments["shell_init_cmd"]])
         if arguments.get("shell_prefix"):
             command.extend(["--shell-prefix", arguments["shell_prefix"]])
         for qemu_arg in arguments.get("qemu_args", []):
-            command.extend(["--qemu-arg", str(qemu_arg)])
+            command.append(f"--qemu-arg={qemu_arg}")
         code, output = run_harness(repo, command)
     elif name == "starry_perf_diff":
         command = [
@@ -211,7 +249,7 @@ def handle_tool_call(repo: Path, params: dict[str, Any]) -> dict[str, Any]:
         host = arguments.get("host", "127.0.0.1")
         port = arguments.get("port", 8765)
         command = [
-            "python3",
+            sys.executable,
             str(repo / "tools/starry-syscall-harness/harness.py"),
             "ui",
             "--repo-root",
@@ -220,6 +258,7 @@ def handle_tool_call(repo: Path, params: dict[str, Any]) -> dict[str, Any]:
             str(host),
             "--port",
             str(port),
+            "--no-docker",
         ]
         if arguments.get("open", False):
             command.append("--open")

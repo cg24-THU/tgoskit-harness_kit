@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import shlex
 import subprocess
 import sys
 import threading
@@ -16,6 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from knowledge_graph import build_knowledge_graph
+
 
 DEFAULT_OUTPUT_DIR = "target/starry-syscall-harness"
 SYSCALL_ARCHES = ("aarch64", "loongarch64", "riscv64", "x86_64")
@@ -24,6 +27,9 @@ PERF_FORMATS = ("all", "folded", "pprof", "svg")
 PERF_MODES = ("insn", "tb")
 MAX_LOG_LINES = 500
 MAX_REQUEST_BYTES = 1_000_000
+MAX_TEXT_FIELD_CHARS = 8192
+MAX_QEMU_ARGS = 256
+MAX_QEMU_ARG_CHARS = 4096
 
 
 class ApiError(Exception):
@@ -75,9 +81,10 @@ class Job:
 
 
 class HarnessUiState:
-    def __init__(self, repo_root: Path, image: str) -> None:
+    def __init__(self, repo_root: Path, image: str, no_docker: bool = False) -> None:
         self.repo_root = repo_root.resolve()
         self.image = image
+        self.no_docker = no_docker
         self.script = self.repo_root / "tools/starry-syscall-harness/harness.py"
         self.web_root = self.repo_root / "tools/starry-syscall-harness/web"
         self.artifact_root = self.repo_root / DEFAULT_OUTPUT_DIR
@@ -85,6 +92,7 @@ class HarnessUiState:
         self.log_root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
         self.jobs: dict[str, Job] = {}
+        self.knowledge_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     def active_job(self) -> Job | None:
         for job in self.jobs.values():
@@ -99,6 +107,7 @@ class HarnessUiState:
         return {
             "repo_root": str(self.repo_root),
             "image": self.image,
+            "mode": "local" if self.no_docker else "docker",
             "server_time": time.time(),
             "active_job": active.to_json() if active else None,
             "reports": {
@@ -131,6 +140,8 @@ class HarnessUiState:
 
     def build_command(self, kind: str, payload: dict[str, Any]) -> tuple[list[str], Path | None]:
         base = [sys.executable, str(self.script), kind, "--repo-root", str(self.repo_root)]
+        if self.no_docker:
+            base.append("--no-docker")
         if kind == "doctor":
             return base + ["--image", self.image], None
 
@@ -161,6 +172,10 @@ class HarnessUiState:
             mode = require_choice(payload.get("mode", "tb"), PERF_MODES, "mode")
             top = require_int(payload.get("top", 20), "top", minimum=1, maximum=200)
             min_percent = require_float(payload.get("min_percent", 5.0), "min_percent", minimum=0.0, maximum=100.0)
+            host_perf_events = optional_text(payload.get("host_perf_events"), "host_perf_events")
+            shell_init_cmd = optional_text(payload.get("shell_init_cmd"), "shell_init_cmd")
+            shell_prefix = optional_text(payload.get("shell_prefix"), "shell_prefix")
+            qemu_args = parse_qemu_args(payload.get("qemu_args"))
             command = [
                 *base,
                 "--arch",
@@ -188,6 +203,18 @@ class HarnessUiState:
                 command.append("--debug")
             if bool(payload.get("kernel_filter", False)):
                 command.append("--kernel-filter")
+            if bool(payload.get("host_time", False)):
+                command.append("--host-time")
+            if bool(payload.get("host_perf", False)):
+                command.append("--host-perf")
+                if host_perf_events is not None:
+                    command.extend(["--host-perf-events", host_perf_events])
+            if shell_init_cmd is not None:
+                command.extend(["--shell-init-cmd", shell_init_cmd])
+            if shell_prefix is not None:
+                command.extend(["--shell-prefix", shell_prefix])
+            for qemu_arg in qemu_args:
+                command.append(f"--qemu-arg={qemu_arg}")
             return command, self.perf_report_path(arch)
 
         baseline = self.resolve_repo_path(str(payload.get("baseline", "")), required=True)
@@ -259,6 +286,47 @@ class HarnessUiState:
         }
         return report
 
+    def load_knowledge_graph(
+        self,
+        task: str,
+        granularity: str,
+        *,
+        scan_root: str,
+        refresh: bool,
+    ) -> dict[str, Any]:
+        task = task.strip()
+        if len(task) > MAX_TEXT_FIELD_CHARS:
+            raise ApiError(HTTPStatus.BAD_REQUEST, f"task must be at most {MAX_TEXT_FIELD_CHARS} characters")
+        if granularity not in {"coarse", "fine"}:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "granularity must be coarse or fine")
+        root = self.resolve_knowledge_root(scan_root)
+        cache_key = (str(root), task, granularity)
+        with self.lock:
+            cached = self.knowledge_cache.get(cache_key)
+        if cached is not None and not refresh:
+            return cached
+        graph = build_knowledge_graph(root, task=task, granularity=granularity)
+        with self.lock:
+            self.knowledge_cache[cache_key] = graph
+        return graph
+
+    def resolve_knowledge_root(self, raw_path: str) -> Path:
+        if not raw_path.strip():
+            return self.repo_root
+        path = Path(raw_path.strip())
+        if not path.is_absolute():
+            path = self.repo_root / path
+        resolved = path.resolve(strict=False)
+        allowed_roots = (self.repo_root, self.repo_root.parent)
+        if not any(is_relative_to(resolved, allowed) for allowed in allowed_roots):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                f"knowledge graph scan root must stay under {self.repo_root} or {self.repo_root.parent}",
+            )
+        if not resolved.is_dir():
+            raise ApiError(HTTPStatus.BAD_REQUEST, f"knowledge graph scan root is not a directory: {resolved}")
+        return resolved
+
     def artifact_state(self, artifacts: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(artifacts, dict):
             return {}
@@ -293,6 +361,7 @@ class HarnessUiState:
                 summary["result"] = report.get("result")
                 summary["samples"] = report.get("hotspots", {}).get("total_samples")
                 summary["fix_candidates"] = len(report.get("fix_candidates", []))
+                summary["host_elapsed_seconds"] = report.get("host_time_metrics", {}).get("elapsed_seconds")
             elif kind == "perf-diff":
                 summary["top_changes"] = len(report.get("top_changes", []))
         except (OSError, json.JSONDecodeError):
@@ -381,8 +450,72 @@ def require_float(value: Any, name: str, *, minimum: float, maximum: float) -> f
     return parsed
 
 
+def optional_text(value: Any, name: str, *, maximum: int = MAX_TEXT_FIELD_CHARS) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"{name} must be a string")
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > maximum:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"{name} must be at most {maximum} characters")
+    if "\x00" in text:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"{name} must not contain NUL bytes")
+    return text
+
+
+def parse_qemu_args(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        args = [require_qemu_arg(item, f"qemu_args[{index}]") for index, item in enumerate(value)]
+        return check_qemu_args([arg for arg in args if arg])
+    if not isinstance(value, str):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "qemu_args must be a string or an array of strings")
+
+    text = optional_text(value, "qemu_args")
+    if text is None:
+        return []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) > 1:
+        return check_qemu_args([require_qemu_arg(line, "qemu_args") for line in lines])
+    try:
+        args = [require_qemu_arg(arg, "qemu_args") for arg in shlex.split(text, comments=False, posix=True)]
+        return check_qemu_args(args)
+    except ValueError as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"qemu_args shell-like parse failed: {exc}") from exc
+
+
+def require_qemu_arg(value: Any, name: str) -> str:
+    if not isinstance(value, str):
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"{name} must be a string")
+    arg = value.strip()
+    if not arg:
+        return ""
+    if len(arg) > MAX_QEMU_ARG_CHARS:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"{name} entries must be at most {MAX_QEMU_ARG_CHARS} characters")
+    if "\x00" in arg or "\n" in arg or "\r" in arg:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"{name} entries must be single-line strings without NUL bytes")
+    return arg
+
+
+def check_qemu_args(args: list[str]) -> list[str]:
+    if len(args) > MAX_QEMU_ARGS:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"qemu_args must contain at most {MAX_QEMU_ARGS} arguments")
+    return args
+
+
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
 
 
 def make_handler(state: HarnessUiState) -> type[BaseHTTPRequestHandler]:
@@ -404,6 +537,16 @@ def make_handler(state: HarnessUiState) -> type[BaseHTTPRequestHandler]:
                     kind = query.get("kind", [""])[0]
                     arch = query.get("arch", [None])[0]
                     self.send_json(state.load_report(kind, arch))
+                    return
+                if parsed.path == "/api/knowledge-graph":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    task = query.get("task", [""])[0]
+                    granularity = query.get("granularity", ["coarse"])[0]
+                    scan_root = query.get("repo_root", [""])[0]
+                    refresh = query.get("refresh", ["0"])[0] in {"1", "true", "yes"}
+                    self.send_json(
+                        state.load_knowledge_graph(task, granularity, scan_root=scan_root, refresh=refresh)
+                    )
                     return
                 if parsed.path == "/api/file":
                     query = urllib.parse.parse_qs(parsed.query)
@@ -488,8 +631,8 @@ def make_handler(state: HarnessUiState) -> type[BaseHTTPRequestHandler]:
     return HarnessRequestHandler
 
 
-def serve_ui(repo_root: Path, host: str, port: int, image: str, open_browser: bool) -> int:
-    state = HarnessUiState(repo_root, image)
+def serve_ui(repo_root: Path, host: str, port: int, image: str, open_browser: bool, no_docker: bool = False) -> int:
+    state = HarnessUiState(repo_root, image, no_docker)
     handler = make_handler(state)
     server = ThreadingHTTPServer((host, port), handler)
     url = f"http://{host}:{server.server_port}/"
