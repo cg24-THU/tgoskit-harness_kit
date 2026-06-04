@@ -20,7 +20,7 @@ from typing import Any
 from knowledge_graph import build_knowledge_graph
 
 
-DEFAULT_OUTPUT_DIR = "target/starry-syscall-harness"
+DEFAULT_OUTPUT_DIR = "target/OScope-harness"
 SYSCALL_ARCHES = ("aarch64", "loongarch64", "riscv64", "x86_64")
 PERF_ARCHES = ("loongarch64", "riscv64")
 PERF_FORMATS = ("all", "folded", "pprof", "svg")
@@ -85,8 +85,9 @@ class HarnessUiState:
         self.repo_root = repo_root.resolve()
         self.image = image
         self.no_docker = no_docker
-        self.script = self.repo_root / "tools/starry-syscall-harness/harness.py"
-        self.web_root = self.repo_root / "tools/starry-syscall-harness/web"
+        app_root = Path(__file__).resolve().parent
+        self.script = app_root / "harness.py"
+        self.web_root = app_root / "web"
         self.artifact_root = self.repo_root / DEFAULT_OUTPUT_DIR
         self.log_root = self.artifact_root / "ui/jobs"
         self.log_root.mkdir(parents=True, exist_ok=True)

@@ -17,7 +17,7 @@ case "$case_name" in
       --workload 'echo reset > /proc/qperf_metrics; echo QPERF_BEGIN:blk-read; dd if=/usr/bin/lto-dump of=/dev/null bs=64k; cat /proc/qperf_metrics; echo QPERF_END:blk-read'
     ;;
   compare-self)
-    python3 tools/starry-syscall-harness/harness.py perf-compare \
+    python3 apps/OScope-harness/harness.py perf-compare \
       --baseline target/qperf/blk-read/perf/riscv64/latest/report.json \
       --candidate target/qperf/blk-read/perf/riscv64/latest/report.json \
       --name blk-self-smoke \
@@ -25,7 +25,7 @@ case "$case_name" in
     ;;
   *)
     cat >&2 <<'EOF'
-usage: tools/starry-syscall-harness/scripts/qperf-smoke.sh [boot|blk-read|compare-self]
+usage: apps/OScope-harness/scripts/qperf-smoke.sh [boot|blk-read|compare-self]
 EOF
     exit 2
     ;;

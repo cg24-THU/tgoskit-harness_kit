@@ -42,7 +42,7 @@ NODE_SPECS: tuple[KnowledgeNodeSpec, ...] = (
         "Kernel API",
         (
             "os/StarryOS/kernel/src/syscall",
-            "tools/starry-syscall-harness/probes",
+            "apps/OScope-harness/probes",
             "components/axerrno",
             "app-runlinuxapp/**",
             "exercise-sysmap/**",
@@ -242,7 +242,7 @@ NODE_SPECS: tuple[KnowledgeNodeSpec, ...] = (
         "qperf_tooling",
         "qperf / harness / GUI",
         "Tooling",
-        ("tools/qperf", "tools/starry-syscall-harness", "scripts/axbuild/src/starry/perf.rs", "docs/qperf"),
+        ("apps/qperf", "apps/OScope-harness", "tools/qperf", "scripts/axbuild/src/starry/perf.rs", "docs/qperf"),
         ("qperf", "harness", "flamegraph", "callchain", "marker", "perf-profile", "perf-compare", "knowledge graph"),
         "qperf plugin/analyzer、harness CLI/MCP/UI、cargo starry perf 和报告生成。",
         "性能工具链对应课程里的 measurement methodology：明确实验窗口、采样偏差、归一化指标和 A/B 对照。",

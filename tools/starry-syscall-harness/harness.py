@@ -20,12 +20,36 @@ CASE_RE = re.compile(r"^CASE\s+(?P<name>\S+)\s*(?P<body>.*)$")
 LOCAL_TOOL_PATHS = (
     os.environ.get("TGOSKIT_HARNESS_QEMU_BIN", ""),
     os.environ.get("TGOSKITS_QEMU_BIN", ""),
+    str(Path(__file__).resolve().parents[3] / ".local/bin"),
     str(Path(__file__).resolve().parents[3] / ".local/qemu-10.2.1/bin"),
     "/opt/homebrew/opt/coreutils/libexec/gnubin",
     "/opt/homebrew/bin",
     "/opt/homebrew/opt/e2fsprogs/bin",
     "/opt/homebrew/opt/e2fsprogs/sbin",
 )
+
+
+def harness_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def harness_script(repo_root: Path) -> Path:
+    candidates = [
+        harness_root() / "harness.py",
+        repo_root / "apps/OScope-harness/harness.py",
+        repo_root / "tools/starry-syscall-harness/harness.py",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return harness_root() / "harness.py"
+
+
+def repo_relative(path: Path, repo_root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(repo_root.resolve()))
+    except ValueError:
+        return str(path)
 
 
 @dataclass(frozen=True)
@@ -86,7 +110,7 @@ def no_docker_requested(args: argparse.Namespace) -> bool:
 
 def with_local_tool_path(env: dict[str, str]) -> dict[str, str]:
     existing = env.get("PATH", "")
-    prefixes = [path for path in LOCAL_TOOL_PATHS if path and Path(path).exists()]
+    prefixes = [path for path in LOCAL_TOOL_PATHS if Path(path).exists()]
     if prefixes:
         env["PATH"] = ":".join([*prefixes, existing]) if existing else ":".join(prefixes)
     return env
@@ -126,8 +150,9 @@ def docker_reexec(repo_root: Path, image: str, argv: list[str]) -> int:
     uid = os.getuid()
     gid = os.getgid()
     chown_paths = docker_chown_paths(argv)
+    script_path = repo_relative(harness_script(repo_root), repo_root)
     script = (
-        'python3 tools/starry-syscall-harness/harness.py "$@"; '
+        f'python3 {shlex.quote(script_path)} "$@"; '
         "status=$?; "
         f"chown -R {uid}:{gid} {' '.join(chown_paths)} 2>/dev/null || true; "
         "exit $status"
@@ -153,7 +178,7 @@ def docker_reexec(repo_root: Path, image: str, argv: list[str]) -> int:
 
 
 def docker_chown_paths(argv: list[str]) -> list[str]:
-    paths = ["target/starry-syscall-harness", "tools/qperf/target"]
+    paths = ["target/OScope-harness", "apps/qperf/target", "tools/qperf/target"]
     for index, arg in enumerate(argv):
         value = None
         if arg == "--output-dir" and index + 1 < len(argv):
@@ -199,6 +224,21 @@ def command_path(name: str) -> str | None:
     return shutil.which(name, path=with_local_tool_path(os.environ.copy()).get("PATH"))
 
 
+def command_stdout(cmd: list[str], cwd: Path) -> str | None:
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=with_local_tool_path(os.environ.copy()),
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
 def doctor(args: argparse.Namespace) -> int:
     repo_root = repo_root_from(Path(args.repo_root)) if args.repo_root else script_repo_root()
     checks: list[dict[str, Any]] = []
@@ -219,13 +259,35 @@ def doctor(args: argparse.Namespace) -> int:
 
         target_check = run(["rustup", "target", "list", "--installed"], cwd=repo_root, check=False, capture=True)
         installed_targets = set(target_check.stdout.splitlines())
-        for target in (
-            "riscv64gc-unknown-none-elf",
-            "aarch64-unknown-none-softfloat",
-            "x86_64-unknown-none",
-            "loongarch64-unknown-none-softfloat",
-        ):
-            checks.append({"name": f"rust-target:{target}", "ok": target in installed_targets})
+        target_arches = {
+            "riscv64gc-unknown-none-elf": None,
+            "aarch64-unknown-none-softfloat": "aarch64",
+            "x86_64-unknown-none": "x86_64",
+            "loongarch64-unknown-none-softfloat": "loongarch64",
+        }
+        for target, optional_arch in target_arches.items():
+            check = {"name": f"rust-target:{target}", "ok": target in installed_targets}
+            if optional_arch:
+                check["optional_for"] = optional_arch
+            checks.append(check)
+
+        gcc_target = command_stdout(["gcc", "-dumpmachine"], cwd=repo_root)
+        checks.append(
+            {
+                "name": "host-linux-oracle",
+                "ok": sys.platform.startswith("linux"),
+                "host": sys.platform,
+                "optional_for": "syscall-discover",
+            }
+        )
+        checks.append(
+            {
+                "name": "gcc-target-linux",
+                "ok": bool(gcc_target and "linux" in gcc_target),
+                "target": gcc_target,
+                "optional_for": "syscall-discover",
+            }
+        )
 
         for name in ("riscv64-linux-musl-gcc", "aarch64-linux-musl-gcc"):
             checks.append(
@@ -2141,7 +2203,7 @@ def write_text(path: Path, content: str) -> None:
 
 def compile_probe(repo_root: Path, work_dir: Path, arch: str) -> tuple[Path, Path]:
     config = ARCHES[arch]
-    source = repo_root / "tools/starry-syscall-harness/probes/syscall_probe.c"
+    source = harness_root() / "probes/syscall_probe.c"
     linux_bin = work_dir / "probe-linux"
     starry_bin = work_dir / f"probe-{arch}"
     run(["gcc", "-O2", "-Wall", "-Wextra", "-o", str(linux_bin), str(source)], cwd=repo_root)
@@ -2267,6 +2329,30 @@ def discover_inside(args: argparse.Namespace) -> int:
         shutil.rmtree(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    if no_docker_requested(args) and not sys.platform.startswith("linux"):
+        message = (
+            "syscall discover --no-docker requires a Linux host for the reference oracle; "
+            f"current host is {sys.platform}. StarryOS qperf and QEMU smoke tests can run "
+            "locally on macOS, but syscall-discover needs a Linux VM/CI host or a Linux "
+            "oracle adapter."
+        )
+        report = {
+            "arch": arch,
+            "result": "unsupported-host",
+            "message": message,
+            "linux": {},
+            "starry": {},
+            "differences": [],
+            "artifacts": {
+                "work_dir": str(work_dir),
+                "report": str(work_dir / "report.json"),
+            },
+        }
+        write_text(work_dir / "report.json", json.dumps(report, indent=2, sort_keys=True))
+        write_text(work_dir / "report.md", f"# Starry syscall discover\n\n{message}\n")
+        print(message, file=sys.stderr)
+        return 1
+
     linux_bin, starry_bin = compile_probe(repo_root, work_dir, arch)
     linux_run = run([str(linux_bin)], cwd=repo_root, check=True, capture=True)
     write_text(work_dir / "linux.stdout", linux_run.stdout)
@@ -2357,7 +2443,7 @@ def main(argv: list[str] | None = None) -> int:
     discover_parser.add_argument("--arch", default="riscv64", choices=sorted(ARCHES))
     discover_parser.add_argument("--image", default=DEFAULT_IMAGE)
     discover_parser.add_argument("--timeout", type=int, default=120)
-    discover_parser.add_argument("--output-dir", default="target/starry-syscall-harness")
+    discover_parser.add_argument("--output-dir", default="target/OScope-harness")
     discover_parser.add_argument("--no-docker", action="store_true")
     discover_parser.add_argument("--fail-on-diff", action="store_true")
     discover_parser.set_defaults(func=discover)
@@ -2377,7 +2463,7 @@ def main(argv: list[str] | None = None) -> int:
     perf_parser.add_argument("--symbol-style", default="full", choices=["full", "short", "module"])
     perf_parser.add_argument("--focus")
     perf_parser.add_argument("--no-truncate", action="store_true")
-    perf_parser.add_argument("--output-dir", default="target/starry-syscall-harness")
+    perf_parser.add_argument("--output-dir", default="target/OScope-harness")
     perf_parser.add_argument("--no-docker", action="store_true")
     perf_parser.add_argument("--debug", action="store_true")
     perf_parser.add_argument("--kernel-filter", action="store_true")
@@ -2440,7 +2526,7 @@ def main(argv: list[str] | None = None) -> int:
     perf_diff_parser.add_argument("--baseline", required=True)
     perf_diff_parser.add_argument("--compare", required=True)
     perf_diff_parser.add_argument("--top", type=int, default=20)
-    perf_diff_parser.add_argument("--output-dir", default="target/starry-syscall-harness")
+    perf_diff_parser.add_argument("--output-dir", default="target/OScope-harness")
     perf_diff_parser.set_defaults(func=perf_diff)
 
     perf_compare_parser = sub.add_parser("perf-compare", help="compare two qperf report.json/profile outputs")
@@ -2451,7 +2537,7 @@ def main(argv: list[str] | None = None) -> int:
     candidate_group.add_argument("--compare")
     perf_compare_parser.add_argument("--top", type=int, default=20)
     perf_compare_parser.add_argument("--name")
-    perf_compare_parser.add_argument("--output-dir", default="target/starry-syscall-harness")
+    perf_compare_parser.add_argument("--output-dir", default="target/OScope-harness")
     perf_compare_parser.set_defaults(func=perf_compare)
 
     ui_parser = sub.add_parser("ui", help="serve the optional local browser UI")

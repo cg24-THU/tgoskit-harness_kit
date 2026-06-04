@@ -9,11 +9,23 @@ from typing import Any
 
 
 PROTOCOL_VERSION = "2024-11-05"
+LOCAL_BIN = str(Path(__file__).resolve().parents[3] / ".local/bin")
 LOCAL_QEMU_BIN = (
     os.environ.get("TGOSKIT_HARNESS_QEMU_BIN")
     or os.environ.get("TGOSKITS_QEMU_BIN")
     or str(Path(__file__).resolve().parents[3] / ".local/qemu-10.2.1/bin")
 )
+
+
+def harness_script(repo: Path) -> Path:
+    for candidate in (
+        Path(__file__).resolve().parent / "harness.py",
+        repo / "apps/OScope-harness/harness.py",
+        repo / "tools/starry-syscall-harness/harness.py",
+    ):
+        if candidate.exists():
+            return candidate
+    return Path(__file__).resolve().parent / "harness.py"
 
 
 def repo_root_from(start: Path) -> Path:
@@ -147,10 +159,11 @@ def tool_schema() -> list[dict[str, Any]]:
 
 
 def run_harness(repo: Path, args: list[str]) -> tuple[int, str]:
-    cmd = [sys.executable, str(repo / "tools/starry-syscall-harness/harness.py"), *args]
+    cmd = [sys.executable, str(harness_script(repo)), *args]
     env = os.environ.copy()
     env["STARRY_SYSCALL_HARNESS_NO_DOCKER"] = "1"
     path_prefix = [
+        LOCAL_BIN,
         LOCAL_QEMU_BIN,
         "/opt/homebrew/opt/coreutils/libexec/gnubin",
         "/opt/homebrew/bin",
@@ -250,7 +263,7 @@ def handle_tool_call(repo: Path, params: dict[str, Any]) -> dict[str, Any]:
         port = arguments.get("port", 8765)
         command = [
             sys.executable,
-            str(repo / "tools/starry-syscall-harness/harness.py"),
+            str(harness_script(repo)),
             "ui",
             "--repo-root",
             str(repo),
@@ -288,7 +301,7 @@ def serve(repo: Path) -> None:
                         "protocolVersion": PROTOCOL_VERSION,
                         "capabilities": {"tools": {"listChanged": False}},
                         "serverInfo": {
-                            "name": "starry-syscall-harness",
+                            "name": "OScope-harness",
                             "version": "0.1.0",
                         },
                     },
