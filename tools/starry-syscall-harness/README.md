@@ -20,12 +20,14 @@ Reports are written under `target/starry-syscall-harness`.
 For day-to-day qperf profiling, prefer the cargo-integrated entrypoint:
 
 ```bash
-cargo starry perf --case boot
-tools/starry-syscall-harness/scripts/qperf-smoke.sh blk-read
+cargo xtask starry perf --timeout 20
+tools/starry-syscall-harness/scripts/qperf-smoke.sh boot
 ```
 
 The harness `perf-profile` command forwards flamegraph readability options such
-as `--symbol-style`, `--focus`, and `--no-truncate`.
+as `--symbol-style`, `--focus`, and `--no-truncate` when the checked-out
+TGOSKits `starry perf` runtime supports them. Workload marker smoke cases such
+as `blk-read` require the enhanced runtime companion.
 
 Useful qperf options:
 

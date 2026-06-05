@@ -239,6 +239,20 @@ def command_stdout(cmd: list[str], cwd: Path) -> str | None:
     return result.stdout.strip()
 
 
+def starry_perf_help(repo_root: Path) -> str:
+    return command_stdout(["cargo", "xtask", "starry", "perf", "--help"], cwd=repo_root) or ""
+
+
+def starry_perf_supports(help_text: str, flag: str) -> bool:
+    return flag in help_text
+
+
+def append_supported(command: list[str], help_text: str, flag: str, *values: object) -> None:
+    if starry_perf_supports(help_text, flag):
+        command.append(flag)
+        command.extend(str(value) for value in values)
+
+
 def doctor(args: argparse.Namespace) -> int:
     repo_root = repo_root_from(Path(args.repo_root)) if args.repo_root else script_repo_root()
     checks: list[dict[str, Any]] = []
@@ -1265,6 +1279,7 @@ def perf_profile_inside(args: argparse.Namespace) -> int:
     qperf_dir.mkdir(parents=True, exist_ok=True)
 
     ensure_starry_qemu_defconfig(repo_root, args.arch)
+    help_text = starry_perf_help(repo_root)
     command = [
         "cargo",
         "xtask",
@@ -1282,52 +1297,46 @@ def perf_profile_inside(args: argparse.Namespace) -> int:
         str(args.max_depth),
         "--mode",
         args.mode,
-        "--perf-callchain",
-        args.callchain,
         "--top",
         str(args.top),
-        "--min-percent",
-        str(args.min_percent),
-        "--symbol-style",
-        args.symbol_style,
         "--out",
         str(qperf_dir),
     ]
+    append_supported(command, help_text, "--perf-callchain", args.callchain)
+    append_supported(command, help_text, "--min-percent", args.min_percent)
+    append_supported(command, help_text, "--symbol-style", args.symbol_style)
     if args.debug:
         command.append("--debug")
     if args.kernel_filter:
-        command.append("--kernel-filter")
-    if args.host_time:
-        command.append("--host-time")
-    else:
-        command.append("--no-host-time")
+        append_supported(command, help_text, "--kernel-filter")
+    append_supported(command, help_text, "--host-time" if args.host_time else "--no-host-time")
     if args.host_perf:
-        command.append("--host-perf")
-        command.extend(["--host-perf-events", args.host_perf_events])
+        append_supported(command, help_text, "--host-perf")
+        append_supported(command, help_text, "--host-perf-events", args.host_perf_events)
     if args.shell_init_cmd:
-        command.extend(["--shell-init-cmd", args.shell_init_cmd])
+        append_supported(command, help_text, "--shell-init-cmd", args.shell_init_cmd)
     if args.shell_prefix:
-        command.extend(["--shell-prefix", args.shell_prefix])
+        append_supported(command, help_text, "--shell-prefix", args.shell_prefix)
     if args.start_marker:
-        command.extend(["--start-marker", args.start_marker])
+        append_supported(command, help_text, "--start-marker", args.start_marker)
     if args.stop_marker:
-        command.extend(["--stop-marker", args.stop_marker])
+        append_supported(command, help_text, "--stop-marker", args.stop_marker)
     if args.workload_timeout is not None:
-        command.extend(["--workload-timeout", str(args.workload_timeout)])
+        append_supported(command, help_text, "--workload-timeout", args.workload_timeout)
     if args.qperf_metrics:
-        command.append("--qperf-metrics")
+        append_supported(command, help_text, "--qperf-metrics")
     if args.full_stack:
-        command.append("--full-stack")
+        append_supported(command, help_text, "--full-stack")
     if args.perf_debuginfo:
-        command.append("--perf-debuginfo")
+        append_supported(command, help_text, "--perf-debuginfo")
     if args.perf_force_frame_pointers:
-        command.append("--perf-force-frame-pointers")
+        append_supported(command, help_text, "--perf-force-frame-pointers")
     if args.focus:
-        command.extend(["--focus", args.focus])
+        append_supported(command, help_text, "--focus", args.focus)
     if args.no_truncate:
-        command.append("--no-truncate")
+        append_supported(command, help_text, "--no-truncate")
     for qemu_arg in args.qemu_arg:
-        command.append(f"--qemu-arg={qemu_arg}")
+        append_supported(command, help_text, "--qemu-arg", qemu_arg)
     run_result = run(command, cwd=repo_root, check=False, capture=True)
     write_text(work_dir / "profile.stdout", run_result.stdout)
     write_text(work_dir / "profile.stderr", run_result.stderr)
